@@ -1,45 +1,57 @@
 import { useState, useEffect, useCallback } from "react";
+import { createClient } from "@supabase/supabase-js";
 
 // ─── SUPABASE CONFIG ─────────────────────────────────────────────────────────
 
 const SUPABASE_URL = "https://tbkzoyibxhmdurpazbc.supabase.co";
 const SUPABASE_KEY = "sb_publishable_pmk8ojYYjv2gsP2s7IBVMQ_6biixa2f";
 
-async function sb(method, table, opts = {}) {
-  const { filter, body, upsert, select = "*" } = opts;
-  let url = `${SUPABASE_URL}/rest/v1/${table}?select=${select}`;
-  if (filter) url += `&${filter}`;
-  if (upsert) url += "&on_conflict=" + upsert;
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-  const headers = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": `Bearer ${SUPABASE_KEY}`,
-    "Content-Type": "application/json",
-    "Prefer": method === "POST" ? (upsert ? "resolution=merge-duplicates,return=representation" : "return=representation") : "return=representation"
-  };
-
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : undefined
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    console.error(`Supabase ${method} ${table}:`, err);
-    return null;
+// Parse PostgREST-style filter strings (e.g. "email=eq.foo&role=eq.student")
+// and apply them to a Supabase query builder chain.
+function applyFilter(q: any, filter?: string) {
+  if (!filter) return q;
+  for (const part of filter.split("&")) {
+    const m = part.match(/^([^=]+)=(eq|gte|lte|gt|lt)\.(.+)$/);
+    if (!m) continue;
+    const [, col, op, val] = m;
+    const decoded = decodeURIComponent(val);
+    if (op === "eq")  q = q.eq(col, decoded);
+    if (op === "gte") q = q.gte(col, decoded);
+    if (op === "lte") q = q.lte(col, decoded);
+    if (op === "gt")  q = q.gt(col, decoded);
+    if (op === "lt")  q = q.lt(col, decoded);
   }
-  if (res.status === 204) return true;
-  return res.json();
+  return q;
 }
 
-// CRUD helpers
 const db = {
-  select: (table, filter, select) => sb("GET", table, { filter, select }),
-  insert: (table, body) => sb("POST", table, { body }),
-  upsert:  (table, body, conflict) => sb("POST", table, { body, upsert: conflict }),
-  update:  (table, filter, body) => sb("PATCH", table, { filter, body }),
-  delete:  (table, filter) => sb("DELETE", table, { filter }),
+  select: async (table: string, filter?: string, sel = "*") => {
+    const { data, error } = await applyFilter(supabase.from(table).select(sel), filter);
+    if (error) { console.error(`Supabase select ${table}:`, error.message); return null; }
+    return data;
+  },
+  insert: async (table: string, body: any) => {
+    const { data, error } = await supabase.from(table).insert(body).select();
+    if (error) { console.error(`Supabase insert ${table}:`, error.message); return null; }
+    return data;
+  },
+  upsert: async (table: string, body: any, conflict: string) => {
+    const { data, error } = await supabase.from(table).upsert(body, { onConflict: conflict }).select();
+    if (error) { console.error(`Supabase upsert ${table}:`, error.message); return null; }
+    return data;
+  },
+  update: async (table: string, filter: string, body: any) => {
+    const { data, error } = await applyFilter(supabase.from(table).update(body), filter).select();
+    if (error) { console.error(`Supabase update ${table}:`, error.message); return null; }
+    return data;
+  },
+  delete: async (table: string, filter: string) => {
+    const { error } = await applyFilter(supabase.from(table).delete(), filter);
+    if (error) { console.error(`Supabase delete ${table}:`, error.message); return null; }
+    return true;
+  },
 };
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
@@ -137,7 +149,6 @@ function generateSimilar(q) {
 
 // ─── SUPABASE STORAGE LAYER ───────────────────────────────────────────────────
 
-// Fallback naar localStorage als Supabase faalt
 function lsGet(k, def = null) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 
@@ -146,11 +157,25 @@ const CURRENT_USER_KEY = "ir_current_user";
 function getCurrentUser() { return lsGet(CURRENT_USER_KEY); }
 function setCurrentUser(u) { u ? lsSet(CURRENT_USER_KEY, u) : localStorage.removeItem(CURRENT_USER_KEY); }
 
-async function findByEmail(email) {
+const DEMO_USERS: Record<string, { id: string; name: string; email: string; role: string }> = {
+  "lisa@student.nl":           { id: "demo-student-lisa",      name: "Lisa de Vries",  email: "lisa@student.nl",           role: "student" },
+  "mohammed@student.nl":       { id: "demo-student-mohammed",  name: "Mohammed Hassan", email: "mohammed@student.nl",       role: "student" },
+  "docent@inclusiefrekenen.nl":{ id: "demo-docent",            name: "Docent Demo",    email: "docent@inclusiefrekenen.nl", role: "docent"  },
+};
+
+async function findByEmail(email: string) {
+  const normalised = email.toLowerCase();
   try {
-    const rows = await db.select("users", `email=eq.${encodeURIComponent(email.toLowerCase())}`);
+    const rows = await db.select("users", `email=eq.${encodeURIComponent(normalised)}`);
     if (rows && rows.length > 0) return rows[0];
   } catch (e) { console.error(e); }
+
+  // Als de user niet in de DB staat maar het is een demo-account: maak hem aan
+  const demo = DEMO_USERS[normalised];
+  if (demo) {
+    try { await db.upsert("users", demo, "email"); } catch {}
+    return demo;
+  }
   return null;
 }
 
